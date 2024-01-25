@@ -794,3 +794,270 @@ def next_business_day(DATE):
     while next_day.weekday() in holidays.WEEKEND or next_day in HOLIDAYS_US:
         next_day += ONE_DAY
     return next_day
+
+
+def price_treasury_ytm(time_to_maturity, ytm, cpn_rate, freq=2, face=100):
+    """
+    Calculates the price of a treasury bond given the time to maturity, yield to maturity, coupon rate, frequency, and face value.
+
+    Parameters:
+    time_to_maturity (float): Time to maturity in years.
+    ytm (float): Yield to maturity as a decimal.
+    cpn_rate (float): Coupon rate as a decimal.
+    freq (int, optional): Coupon payment frequency per year. Defaults to 2.
+    face (int, optional): Face value of the bond. Defaults to 100.
+
+    Returns:
+    float: The price of the treasury bond.
+    """
+    c = cpn_rate/freq
+    y = ytm/freq
+    
+    tau = round(time_to_maturity * freq)
+    
+    pv = 0
+    for i in range(1,tau):
+        pv += 1 / (1+y)**i
+    
+    pv = c*pv + (1+c)/(1+y)**tau
+    pv *= face
+    
+    return pv
+
+
+
+def duration_closed_formula(tau, ytm, cpnrate=None, freq=2):
+    """
+    Calculates the duration of a fixed-income security using the closed-formula method.
+
+    Parameters:
+    - tau (float): Time to maturity in years.
+    - ytm (float): Yield to maturity as a decimal.
+    - cpnrate (float, optional): Coupon rate as a decimal. If not provided, it is assumed to be equal to the yield to maturity.
+    - freq (int, optional): Number of coupon payments per year. Default is 2.
+
+    Returns:
+    - duration (float): Duration of the fixed-income security.
+    """
+    if cpnrate is None:
+        cpnrate = ytm
+        
+    y = ytm/freq
+    c = cpnrate/freq
+    T = tau * freq
+        
+    if cpnrate==ytm:
+        duration = (1+y)/y  * (1 - 1/(1+y)**T)
+        
+    else:
+        duration = (1+y)/y - (1+y+T*(c-y)) / (c*((1+y)**T-1)+y)
+
+    duration /= freq
+    
+    return duration
+
+
+def get_spread_bps(database):
+    """
+    Calculate the spread in basis points (bps) for each treasury bond in the database.
+
+    Parameters:
+    - database: pandas DataFrame containing the treasury bond data
+
+    Returns:
+    - spread: pandas DataFrame containing the spread in bps for each treasury bond
+    """
+    ylds = database.pivot_table(index='CALDT',columns='KYTREASNO',values='TDYLD')
+    ylds *= 365 * 100 * 100
+    
+    spread = -ylds.sub(ylds.iloc[:,0],axis=0)
+    
+    return spread
+
+
+
+def get_key_info(info):
+    """
+    Retrieves key information from the given DataFrame.
+
+    Parameters:
+    info (DataFrame): The DataFrame containing the information.
+
+    Returns:
+    DataFrame: The key information with updated column names and type labels.
+    """
+    keys = ['kytreasno','tdatdt','tmatdt','tcouprt','itype']
+    key_info = info.loc[keys]
+    key_info.index = ['kytreasno','issue date','maturity date','coupon rate','type']
+    key_info.loc['type',key_info.loc['type']==1] = 'bond'
+    key_info.loc['type',key_info.loc['type']==2] = 'note'
+    key_info.loc['type',key_info.loc['type']==3] = 'bill'
+    key_info.loc['type',key_info.loc['type']==11] = 'TIPS bond'
+    key_info.loc['type',key_info.loc['type']==12] = 'TIPS note'
+    key_info.columns = key_info.loc['issue date']
+    return key_info
+
+
+
+def get_snapshot(database, date):
+    """
+    Retrieves a snapshot of treasury metrics for a given date from a database.
+
+    Parameters:
+    - database (DataFrame): The database containing treasury data.
+    - date (str): The date for which the snapshot is requested.
+
+    Returns:
+    - metrics (DataFrame): A DataFrame containing various treasury metrics for the specified date.
+    """
+
+    datasnap = database[database['CALDT'] == date].T
+
+    metrics = datasnap.loc[['KYTREASNO', 'CALDT', 'TDBID', 'TDASK', 'TDACCINT']]
+    metrics.loc['clean price'] = (metrics.loc['TDBID'] + metrics.loc['TDASK']) / 2
+    metrics.loc['dirty price'] = metrics.loc['clean price'] + metrics.loc['TDACCINT']
+    metrics.loc['duration'] = datasnap.loc['TDDURATN'] / 365.25
+    ytm = (datasnap.loc['TDYLD'] * 365.25)
+    metrics.loc['modified duration'] = metrics.loc['duration'] / (1 + ytm / 2)
+    metrics.loc['ytm'] = ytm
+    metrics.columns = metrics.loc['CALDT']
+    metrics.drop('CALDT', inplace=True)
+    metrics.index = metrics.index.str.lower()
+    metrics.rename({'tdbid': 'bid', 'tdask': 'ask', 'tdaccint': 'accrued interest'}, inplace=True)
+
+    return metrics
+
+
+
+def get_table(info, database, date):
+    """
+    Retrieves a table by merging key information and metrics based on the given parameters.
+
+    Parameters:
+        info (str): The key information.
+        database (str): The database to retrieve metrics from.
+        date (str): The date of the snapshot.
+
+    Returns:
+        pandas.DataFrame: The merged table.
+    """
+
+    keyinfo = get_key_info(info)
+    metrics = get_snapshot(database, date)
+
+    table = pd.merge(keyinfo.T, metrics.T, on='kytreasno', how='inner').T
+    table.columns = table.loc['kytreasno']
+    table.drop('kytreasno', inplace=True)
+
+    return table
+
+
+def pnl_spread_trade(spread_convergence, modified_duration, price, contracts):    
+    """
+    Calculate the profit and loss (pnl) of a spread trade based on spread convergence, modified duration, price, and contracts.
+
+    Parameters:
+    spread_convergence (float): The spread convergence value.
+    modified_duration (pd.Series): A pandas Series containing modified duration values.
+    price (pd.Series): A pandas Series containing price values.
+    contracts (pd.Series): A pandas Series containing contract values.
+
+    Returns:
+    tuple: A tuple containing the pnl table and a dictionary of formatting options.
+    """
+    table = pd.DataFrame(dtype='float64',index=modified_duration.index)
+    table['ytm change'] = spread_convergence/2 * np.array([-1,1])
+    table['modified duration'] = modified_duration    
+    table['price'] = price
+    table['contracts'] = contracts
+    table['pnl'] = - table['modified duration'] * table['price'] * table['ytm change'] * table['contracts']
+    table.loc['total','pnl'] = table['pnl'].sum()
+        
+    fmt_dict = {'ytm change':'{:.4%}','modified duration':'{:,.2f}','dollar modified duration':'{:,.2f}','contracts':'{:,.2f}','price':'${:,.2f}','pnl':'${:,.2f}'}
+    
+    return table, fmt_dict
+
+def trade_balance_sheet(prices, durations, haircuts, key_long, key_short, long_equity=None, long_assets=None):
+    """
+    Calculate the balance sheet for a trade based on prices, durations, haircuts, and positions.
+
+    Parameters:
+    prices (pd.Series): Series of prices for the assets.
+    durations (pd.Series): Series of durations for the assets.
+    haircuts (pd.Series): Series of haircuts for the assets.
+    key_long (str): Key for the long position.
+    key_short (str): Key for the short position.
+    long_equity (float, optional): Long equity position. Defaults to None.
+    long_assets (float, optional): Long assets position. Defaults to None.
+
+    Returns:
+    tuple: A tuple containing the balance sheet dataframe and the format dictionary.
+    """
+    hedge_ratio = -durations[key_long]/durations[key_short]
+
+    balsheet = pd.DataFrame(dtype='float64',index=[key_long,key_short],columns=['equity','assets'])
+
+    if long_equity is not None:
+        balsheet['assets'] = long_equity / haircuts.values
+    elif long_assets is not None:
+        balsheet.loc[key_long,'assets'] = long_assets
+    else:
+        error('Must input long equity or long assets.')
+        
+    balsheet.loc[key_short,'assets'] = balsheet.loc[key_long,'assets'] * hedge_ratio
+    balsheet['equity'] = balsheet['assets'] * haircuts.values
+
+    balsheet['contracts'] = balsheet['assets'] / prices
+    fmt = {'equity':'${:,.2f}','assets':'${:,.2f}','contracts':'{:,.2f}'}
+    
+    return balsheet, fmt
+
+def trade_evolution(date0, date_maturity, n_weeks, balsheet, price_ts, duration_ts, financing, cpn_rates, key_long, key_short):
+    """
+    Calculates the trade evolution over a specified number of weeks.
+
+    Parameters:
+    date0 (str): The starting date in the format 'YYYY-MM-DD'.
+    date_maturity (str): The maturity date in the format 'YYYY-MM-DD'.
+    n_weeks (int): The number of weeks to calculate the trade evolution.
+    balsheet (pd.DataFrame): The balance sheet data.
+    price_ts (pd.DataFrame): The price time series data.
+    duration_ts (pd.DataFrame): The duration time series data.
+    financing (dict): The financing data.
+    cpn_rates (float): The coupon rates.
+    key_long (str): The key for long assets.
+    key_short (str): The key for short assets.
+
+    Returns:
+    pnl (pd.DataFrame): The profit and loss data.
+    fmt_dict (dict): The formatting dictionary for display.
+    """
+    dt0 = datetime.datetime.strptime(date0,'%Y-%m-%d') 
+    
+    cpn_dates = get_coupon_dates(date0,date_maturity)
+    
+    pnl = pd.DataFrame(dtype='float64',index=[dt0],columns=['price change', 'coupons', 'total pnl', 'equity'])
+    pnl.loc[dt0] = [0, 0, 0, balsheet['equity'].abs().sum()]
+
+    for i in range(1,n_weeks):
+        dt = dt0 + datetime.timedelta(weeks=i)
+        dt = prev_bday(dt)
+
+        cpn_payments = (dt > cpn_dates).sum()
+        pnl.loc[dt,'price change'] = (price_ts.loc[[dt0,dt]] * balsheet['contracts']).diff().sum(axis=1).loc[dt]
+        pnl.loc[dt,'coupons'] = (cpn_rates * balsheet['contracts'] * cpn_payments / 2).sum()
+        pnl.loc[dt,'total pnl'] = pnl.loc[dt,['price change','coupons']].sum()
+
+        temp, _ = trade_balance_sheet(price_ts.loc[dt], duration_ts.loc[dt], financing['haircut'], key_long, key_short, long_assets=balsheet.loc[key_long,'contracts']*price_ts.loc[dt,key_long])
+        pnl.loc[dt,'equity'] = temp['equity'].abs().sum()
+
+    pnl['margin call'] = pnl['equity'].diff() - pnl['total pnl'].diff()
+    pnl.loc[dt0,'margin call'] = 0
+    pnl['capital paid in'] = pnl['equity'] + pnl['margin call'].cumsum()
+
+    pnl['return (init equity)'] = pnl['total pnl'] / pnl.loc[dt0,'capital paid in']
+    pnl['return (avg equity)'] = pnl['total pnl'] / pnl['capital paid in'].expanding().mean()
+
+    fmt_dict = {'price change':'${:,.2f}','coupons':'${:,.2f}','total pnl':'${:,.2f}','equity':'${:,.2f}','margin call':'${:,.2f}','capital paid in':'${:,.2f}', 'return (init equity)':'{:.2%}', 'return (avg equity)':'{:.2%}'}
+
+    return pnl, fmt_dict
